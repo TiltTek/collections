@@ -5,16 +5,21 @@ declare(strict_types=1);
 namespace Tilttek\Collections\Tests\Unit\Pack;
 
 use DateTimeImmutable;
+use Override;
+use Phil\Resource\ResourceReference;
 use PHPUnit\Framework\Attributes\CoversClass;
 use PHPUnit\Framework\Attributes\DataProvider;
 use PHPUnit\Framework\TestCase;
 use Random\Engine\Xoshiro256StarStar;
 use Random\Randomizer;
+use Tilttek\Collections\CollectionKey;
 use Tilttek\Collections\Copy;
 use Tilttek\Collections\Exception\CollectionRefused;
 use Tilttek\Collections\Exception\InvalidCollection;
 use Tilttek\Collections\Exception\NotFound;
 use Tilttek\Collections\FixedCatalog;
+use Tilttek\Collections\Pack\InMemoryOpeningStore;
+use Tilttek\Collections\Pack\OpeningStore;
 use Tilttek\Collections\Pack\PackOpening;
 use Tilttek\Collections\Pack\Packs;
 use Tilttek\Collections\Pack\PendingOpening;
@@ -22,6 +27,7 @@ use Tilttek\Collections\Pack\SecureSeeds;
 use Tilttek\Collections\Source;
 use Tilttek\Collections\Tests\Unit\Fixture\FixedSeeds;
 use Tilttek\Collections\Tests\Unit\Fixture\Kit;
+use Tilttek\Collections\Tests\Unit\Fixture\RacingOpeningStore;
 
 #[CoversClass(Packs::class)]
 #[CoversClass(PendingOpening::class)]
@@ -115,7 +121,7 @@ final class PacksTest extends TestCase
 
         self::assertSame('2026-11-01', $opening->openedAt->format('Y-m-d'));
         self::assertSame($this->draw('crew-pack', str_pad('seed-0', 16, '.'), 'mine', 'shop:1', 2), $opening->items);
-        self::assertSame($opening, $kit->packs->open($pending, 'mine'));
+        self::assertEquals($opening, $kit->packs->open($pending, 'mine'));
         self::assertCount(2, $kit->collections->copiesOf($member));
 
         foreach ([['member:1', 'booster'], ['member:2', 'crew-pack']] as [$who, $pack]) {
@@ -126,6 +132,148 @@ final class PacksTest extends TestCase
                 self::assertSame('The key "shop:1" already opened another pack.', $collectionRefused->getMessage());
             }
         }
+    }
+
+    public function testAnOpeningThatLosesTheRaceForItsKeyReturnsTheWinnerAndGivesNothing(): void
+    {
+        $kit = Kit::standard();
+        $member = Kit::ref('member:1');
+        $seed = bin2hex(str_pad('seed-0', 16, '.'));
+        $winner = new PackOpening('shop:1', $member, 'crew-pack', $seed, Packs::commitment(str_pad('seed-0', 16, '.')), 'mine', ['pirate', 'deckhand'], ['c1', 'c2'], new DateTimeImmutable('2026-11-01 UTC'));
+        $packs = new Packs($kit->collections, new RacingOpeningStore($winner), new FixedSeeds(), $kit->clock);
+
+        self::assertSame($winner, $packs->open($packs->commit($member, 'crew-pack', 'shop:1'), 'mine'));
+        self::assertSame([], $kit->collections->copiesOf($member));
+    }
+
+    public function testAnOpeningThatLosesTheRaceToAnotherClientSeedIsRefusedAndGivesNothing(): void
+    {
+        $kit = Kit::standard();
+        $member = Kit::ref('member:1');
+        $seed = str_pad('seed-0', 16, '.');
+        $winner = new PackOpening('shop:1', $member, 'crew-pack', bin2hex($seed), Packs::commitment($seed), 'theirs', ['pirate', 'deckhand'], [], new DateTimeImmutable('2026-11-01 UTC'));
+        $packs = new Packs($kit->collections, new RacingOpeningStore($winner), new FixedSeeds(), $kit->clock);
+
+        try {
+            $packs->open($packs->commit($member, 'crew-pack', 'shop:1'), 'mine');
+            self::fail('Opened.');
+        } catch (CollectionRefused $collectionRefused) {
+            self::assertSame('The key "shop:1" was opened from another commitment or client seed.', $collectionRefused->getMessage());
+        }
+
+        self::assertSame([], $kit->collections->copiesOf($member));
+    }
+
+    public function testAClientSeedIsCheckedBeforeTheOpeningKeptUnderTheKeyIsRead(): void
+    {
+        $kit = Kit::standard();
+        $pending = $kit->packs->commit(Kit::ref('member:1'), 'crew-pack', 'shop:1');
+        $kit->packs->open($pending, 'mine');
+
+        $this->expectExceptionObject(InvalidCollection::because('A client seed is 1 to 256 bytes of UTF-8 text.'));
+
+        $kit->packs->open($pending, '');
+    }
+
+    public function testAWinnerGoneBeforeItIsReadIsRefused(): void
+    {
+        $kit = Kit::standard();
+        $packs = new Packs($kit->collections, new RacingOpeningStore(null), new FixedSeeds(), $kit->clock);
+
+        $this->expectExceptionObject(CollectionRefused::because('The key "shop:1" is being opened by another request.'));
+
+        $packs->open($packs->commit(Kit::ref('member:1'), 'crew-pack', 'shop:1'), 'mine');
+    }
+
+    public function testAWinnerStillGivingItsCopiesIsReturnedOnlyOnceTheyAreGiven(): void
+    {
+        $kit = Kit::standard();
+        $member = Kit::ref('member:1');
+        $seed = str_pad('seed-0', 16, '.');
+        $items = $this->draw('crew-pack', $seed, 'mine', 'shop:1', 2);
+        $winner = new PackOpening('shop:1', $member, 'crew-pack', bin2hex($seed), Packs::commitment($seed), 'mine', $items, [], new DateTimeImmutable('2026-11-01 UTC'));
+        $store = new RacingOpeningStore($winner);
+        $packs = new Packs($kit->collections, $store, new FixedSeeds(), $kit->clock);
+
+        // The winner reserved the key and has not given its copies yet, or stopped: the loser gives them under the same
+        // keys, then returns the opening complete, with exactly its copies.
+        $opening = $packs->open($packs->commit($member, 'crew-pack', 'shop:1'), 'mine');
+        $given = $kit->collections->copiesOf($member);
+
+        self::assertSame([Copy::idFor(CollectionKey::fromString('shop:1')->derive('1')), Copy::idFor(CollectionKey::fromString('shop:1')->derive('2'))], $opening->copies);
+        self::assertSame($items, $opening->items);
+        self::assertSame($opening->copies, array_map(static fn (Copy $copy): string => $copy->id, $given));
+        self::assertSame($items, array_map(static fn (Copy $copy): string => $copy->item, $given));
+        self::assertSame($opening->copies, $store->inner->find('shop:1')?->copies);
+    }
+
+    public function testAnOpeningReservedButNotGivenIsGivenWhenOpenedAgain(): void
+    {
+        $kit = Kit::standard();
+        $member = Kit::ref('member:1');
+        $seed = str_pad('seed-0', 16, '.');
+        $items = $this->draw('crew-pack', $seed, 'mine', 'shop:1', 2);
+        $kit->openings->add(new PackOpening('shop:1', $member, 'crew-pack', bin2hex($seed), Packs::commitment($seed), 'mine', $items, [], new DateTimeImmutable('2026-11-01 UTC')));
+
+        $opening = $kit->packs->open($kit->packs->commit($member, 'crew-pack', 'shop:1'), 'mine');
+
+        self::assertSame($items, array_map(static fn (string $id): string => $kit->collections->copy($id)->item, $opening->copies));
+        self::assertSame('2026-11-01', $kit->collections->copy($opening->copies[0])->acquiredAt->format('Y-m-d'));
+        self::assertSame($opening->copies, $kit->openings->find('shop:1')?->copies);
+        self::assertCount(2, $kit->collections->copiesOf($member));
+    }
+
+    public function testAnOpeningKeptUnderTheKeyIsReturnedWithoutBeingAddedAgain(): void
+    {
+        $kit = Kit::standard();
+        $member = Kit::ref('member:1');
+        $store = new class implements OpeningStore {
+            public int $additions = 0;
+
+            private readonly InMemoryOpeningStore $inner;
+
+            public function __construct()
+            {
+                $this->inner = new InMemoryOpeningStore();
+            }
+
+            #[Override]
+            public function add(PackOpening $opening): bool
+            {
+                ++$this->additions;
+
+                return $this->inner->add($opening);
+            }
+
+            #[Override]
+            public function complete(string $key, array $copies): void
+            {
+                $this->inner->complete($key, $copies);
+            }
+
+            #[Override]
+            public function find(string $key): ?PackOpening
+            {
+                return $this->inner->find($key);
+            }
+
+            #[Override]
+            public function ofMember(ResourceReference $member): array
+            {
+                return $this->inner->ofMember($member);
+            }
+
+            #[Override]
+            public function eraseMember(ResourceReference $member): int
+            {
+                return $this->inner->eraseMember($member);
+            }
+        };
+        $packs = new Packs($kit->collections, $store, new FixedSeeds([str_pad('seed-0', 16, '.'), str_pad('seed-0', 16, '.')]), $kit->clock);
+        $first = $packs->open($packs->commit($member, 'crew-pack', 'shop:1'), 'mine');
+
+        self::assertEquals($first, $packs->open($packs->commit($member, 'crew-pack', 'shop:1'), 'mine'));
+        self::assertSame(1, $store->additions);
     }
 
     public function testAKeyOpenedFromAnotherCommitmentIsRefused(): void

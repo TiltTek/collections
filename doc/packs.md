@@ -18,8 +18,13 @@ A pack opens in two steps, so that neither the site nor the member can choose th
    a rarity by weight, then an item of that rarity — and gives a copy of each, under the key followed by `#` and the
    place of the item.
 
-The same pending opening and client seed opened again return the opening they made; a key that opened another pack,
-or for another member, or from another seed or client seed, is refused.
+The opening reserves its key before it gives anything: it is added with no copies, then the copies are given and
+recorded. Of two requests that open the same key at the same moment, only the one whose addition wrote draws the
+opening; the other returns the winner's opening, always complete — or is refused, when the winner came from another
+client seed. When the winner has not given its copies yet, or stopped before, the other gives them under the same keys,
+which give each copy once, so that the opening it returns names copies that exist. The same pending opening and client seed opened again return the opening they made, and give the copies of one
+whose giving was interrupted; a key that opened another pack, or for another member, or from another seed or client
+seed, is refused.
 
 The draw is the one both seeds and the key give: `Xoshiro256StarStar` seeded by the HMAC-SHA256, under the seed, of
 the client seed, a line feed and the key. The site's seed is fixed before the member's client seed is known, and the
